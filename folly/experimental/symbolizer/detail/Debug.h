@@ -26,7 +26,7 @@ namespace folly {
 namespace symbolizer {
 namespace detail {
 
-#if defined(__linux__) && FOLLY_HAVE_ELF && FOLLY_HAVE_DWARF
+#if defined(__linux__) && defined(__GLIBC__) && FOLLY_HAVE_ELF && FOLLY_HAVE_DWARF
 inline struct r_debug* get_r_debug() {
   return &_r_debug;
 }
