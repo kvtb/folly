@@ -649,6 +649,11 @@ if (BUILD_TESTS)
     DIRECTORY experimental/io/test/
       TEST fs_util_test SOURCES FsUtilTest.cpp
 
+    DIRECTORY experimental/exception_tracer/test/
+      TEST exception_counter_test SOURCES ExceptionCounterTest.cpp
+      TEST exception_tracer_test SOURCES ExceptionTracerTest.cpp
+      TEST smart_exception_tracer_test SOURCES SmartExceptionTracerTest.cpp 
+
     DIRECTORY external/farmhash/test/
       TEST farmhash_test SOURCES farmhash_test.cpp
 
