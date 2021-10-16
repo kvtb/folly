@@ -211,7 +211,9 @@ TEST(Arena, Clear) {
     int j = 0;
     for (auto s : sizes) {
       auto addr = arena.allocate(s);
-      if (s <= blockSize) {
+      if (s == 0) {
+        EXPECT_TRUE(addr == nullptr || addresses[j] == nullptr || addr == addresses[j]);
+      } else if (s <= blockSize) {
         EXPECT_EQ(addr, addresses[j]);
       }
       j++;
