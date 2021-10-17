@@ -90,6 +90,134 @@ void printAsyncStackInfo(PrintFunc print) {
 
 namespace {
 
+/**
+ * Read a hex value.
+ */
+uintptr_t readHex(StringPiece& sp) {
+  uintptr_t val = 0;
+  const char* p = sp.begin();
+  for (; p != sp.end(); ++p) {
+    unsigned int v;
+    if (*p >= '0' && *p <= '9') {
+      v = (*p - '0');
+    } else if (*p >= 'a' && *p <= 'f') {
+      v = (*p - 'a') + 10;
+    } else if (*p >= 'A' && *p <= 'F') {
+      v = (*p - 'A') + 10;
+    } else {
+      break;
+    }
+    val = (val << 4) + v;
+  }
+  sp.assign(p, sp.end());
+  return val;
+}
+
+/**
+ * Skip over non-space characters.
+ */
+void skipNS(StringPiece& sp) {
+  const char* p = sp.begin();
+  for (; p != sp.end() && (*p != ' ' && *p != '\t'); ++p) { }
+  sp.assign(p, sp.end());
+}
+
+/**
+ * Skip over space and tab characters.
+ */
+void skipWS(StringPiece& sp) {
+  const char* p = sp.begin();
+  for (; p != sp.end() && (*p == ' ' || *p == '\t'); ++p) { }
+  sp.assign(p, sp.end());
+}
+
+/**
+ * Parse a line from /proc/self/maps
+ */
+bool parseProcMapsLine(StringPiece line,
+                       uintptr_t& from,
+                       uintptr_t& to,
+                       uintptr_t& fileOff,
+                       bool& isSelf,
+                       StringPiece& fileName) {
+  isSelf = false;
+  // from     to       perm offset   dev   inode             path
+  // 00400000-00405000 r-xp 00000000 08:03 35291182          /bin/cat
+  if (line.empty()) {
+    return false;
+  }
+
+  // Remove trailing newline, if any
+  if (line.back() == '\n') {
+    line.pop_back();
+  }
+
+  // from
+  from = readHex(line);
+  if (line.empty() || line.front() != '-') {
+    return false;
+  }
+  line.pop_front();
+
+  // to
+  to = readHex(line);
+  if (line.empty() || line.front() != ' ') {
+    return false;
+  }
+  line.pop_front();
+
+  // perms
+  skipNS(line);
+  if (line.empty() || line.front() != ' ') {
+    return false;
+  }
+  line.pop_front();
+
+  uintptr_t fileOffset = readHex(line);
+  if (line.empty() || line.front() != ' ') {
+    return false;
+  }
+  line.pop_front();
+  // main mapping starts at 0 but there can be multi-segment binary
+  // such as
+  // from     to       perm offset   dev   inode             path
+  // 00400000-00405000 r-xp 00000000 08:03 54011424          /bin/foo
+  // 00600000-00605000 r-xp 00020000 08:03 54011424          /bin/foo
+  // 00800000-00805000 r-xp 00040000 08:03 54011424          /bin/foo
+  // if the offset > 0, this indicates to the caller that the baseAddress
+  // need to be used for undo relocation step.
+  fileOff = fileOffset;
+
+  // dev
+  skipNS(line);
+  if (line.empty() || line.front() != ' ') {
+    return false;
+  }
+  line.pop_front();
+
+  // inode
+  skipNS(line);
+  if (line.empty() || line.front() != ' ') {
+    return false;
+  }
+
+  // if inode is 0, such as in case of ANON pages, there should be atleast
+  // one white space before EOL
+  skipWS(line);
+  if (line.empty()) {
+    // There will be no fileName for ANON text pages
+    // if the parsing came this far without a fileName, then from/to address
+    // may contain text in ANON pages.
+    isSelf = true;
+    fileName.clear();
+    return true;
+  }
+
+  fileName = line;
+  return true;
+}
+
+
 ElfCache* defaultElfCache() {
   static auto cache = new ElfCache();
   return cache;
@@ -120,7 +248,7 @@ void setSymbolizedFrame(
 } // namespace
 
 bool Symbolizer::isAvailable() {
-  return detail::get_r_debug();
+  return true;
 }
 
 Symbolizer::Symbolizer(
@@ -136,14 +264,12 @@ size_t Symbolizer::symbolize(
     folly::Range<SymbolizedFrame*> frames) {
   size_t addrCount = addrs.size();
   size_t frameCount = frames.size();
+
   FOLLY_SAFE_CHECK(addrCount <= frameCount, "Not enough frames.");
   size_t remaining = addrCount;
 
-  auto const dbg = detail::get_r_debug();
-  if (dbg == nullptr) {
-    return 0;
-  }
-  if (dbg->r_version != 1) {
+  int fd = openNoInt("/proc/self/maps", O_RDONLY);
+  if (fd == -1) {
     return 0;
   }
 
@@ -157,6 +283,7 @@ size_t Symbolizer::symbolize(
 
   for (size_t i = 0; i < addrCount; i++) {
     frames[i].addr = addrs[i];
+    CHECK(!frames[i].found);
   }
 
   // Find out how many frames were filled in.
@@ -168,19 +295,35 @@ size_t Symbolizer::symbolize(
         }));
   };
 
-  for (auto lmap = dbg->r_map; lmap != nullptr && remaining != 0;
-       lmap = lmap->l_next) {
-    // The empty string is used in place of the filename for the link_map
-    // corresponding to the running executable.  Additionally, the `l_addr' is
-    // 0 and the link_map appears to be first in the list---but none of this
-    // behavior appears to be documented, so checking for the empty string is
-    // as good as anything.
-    auto const objPath = lmap->l_name[0] != '\0' ? lmap->l_name : selfPath;
+  char buf[PATH_MAX + 100];  // Long enough for any line
+  LineReader reader(fd, buf, sizeof(buf));
 
-    auto const elfFile = cache_->getFile(objPath);
-    if (!elfFile) {
-      continue;
+  StringPiece line;
+  std::string currentFileName = selfPath;
+  uintptr_t currentBase = 0;
+  while (remaining != 0 && reader.readLine(line) == LineReader::kReading) {
+    // Parse line
+    uintptr_t from;
+    uintptr_t to;
+    uintptr_t fileOff;
+    bool isSelf = false; // fileName can potentially be '/proc/self/exe'
+    StringPiece fileName;
+    CHECK(parseProcMapsLine(line, from, to, fileOff, isSelf, fileName));
+    std::shared_ptr<ElfFile> elfFile;
+
+    // case of text on ANON?
+    // Recompute from/to/base from the executable
+    if (isSelf && fileName.empty()) {
+      fileName = selfPath;
     }
+
+    if (fileName != currentFileName) {
+      currentFileName = fileName;
+      currentBase = from;
+    }
+    if (fileName == selfPath)
+      currentBase = 0;
+
 
     for (size_t i = 0; i < addrCount && remaining != 0; ++i) {
       auto& frame = frames[i];
@@ -189,79 +332,89 @@ size_t Symbolizer::symbolize(
       }
 
       auto const addr = frame.addr;
-      if (symbolCache_) {
-        // Need a write lock, because EvictingCacheMap brings found item to
-        // front of eviction list.
-        auto lockedSymbolCache = symbolCache_->wlock();
-
-        auto const iter = lockedSymbolCache->find(addr);
-        if (iter != lockedSymbolCache->end()) {
-          size_t numCachedFrames = countFrames(folly::range(iter->second));
-          // 1 entry in cache is the non-inlined function call and that one
-          // already has space reserved at `frames[i]`
-          auto numInlineFrames = numCachedFrames - 1;
-          if (numInlineFrames <= frameCount - addrCount) {
-            // Move the rest of the frames to make space for inlined frames.
-            std::move_backward(
-                frames.begin() + i + 1,
-                frames.begin() + addrCount,
-                frames.begin() + addrCount + numInlineFrames);
-            // Overwrite frames[i] too (the non-inlined function call entry).
-            std::copy(
-                iter->second.begin(),
-                iter->second.begin() + numInlineFrames + 1,
-                frames.begin() + i);
-            i += numInlineFrames;
-            addrCount += numInlineFrames;
-          }
-          continue;
-        }
+      if (from > addr || addr >= to) {
+        continue;
       }
+      elfFile = cache_->getFile(fileName);
+
+      if (!elfFile) {
+        continue;
+      }
+
+//    if (symbolCache_) {
+//      // Need a write lock, because EvictingCacheMap brings found item to
+//      // front of eviction list.
+//      auto lockedSymbolCache = symbolCache_->wlock();
+//
+//      auto const iter = lockedSymbolCache->find(addr);
+//      if (iter != lockedSymbolCache->end()) {
+//        size_t numCachedFrames = countFrames(folly::range(iter->second));
+//        // 1 entry in cache is the non-inlined function call and that one
+//        // already has space reserved at `frames[i]`
+//        auto numInlineFrames = numCachedFrames - 1;
+//        if (numInlineFrames <= frameCount - addrCount) {
+//          // Move the rest of the frames to make space for inlined frames.
+//          std::move_backward(
+//              frames.begin() + i + 1,
+//              frames.begin() + addrCount,
+//              frames.begin() + addrCount + numInlineFrames);
+//          // Overwrite frames[i] too (the non-inlined function call entry).
+//          std::copy(
+//              iter->second.begin(),
+//              iter->second.begin() + numInlineFrames + 1,
+//              frames.begin() + i);
+//          i += numInlineFrames;
+//          addrCount += numInlineFrames;
+//        }
+//        continue;
+//      }
+//    }
 
       // Get the unrelocated, ELF-relative address by normalizing via the
       // address at which the object is loaded.
-      auto const adjusted = addr - reinterpret_cast<uintptr_t>(lmap->l_addr);
-      size_t numInlined = 0;
+      auto const adjusted = addr - currentBase;
+//    size_t numInlined = 0;
       if (elfFile->getSectionContainingAddress(adjusted)) {
-        if (mode_ == LocationInfoMode::FULL_WITH_INLINE &&
-            frameCount > addrCount) {
-          size_t maxInline = std::min<size_t>(
-              Dwarf::kMaxInlineLocationInfoPerFrame, frameCount - addrCount);
-          // First use the trailing empty frames (index starting from addrCount)
-          // to get the inline call stack, then rotate these inline functions
-          // before the caller at `frame[i]`.
-          folly::Range<SymbolizedFrame*> inlineFrameRange(
-              frames.begin() + addrCount,
-              frames.begin() + addrCount + maxInline);
-          setSymbolizedFrame(frame, elfFile, adjusted, mode_, inlineFrameRange);
-
-          numInlined = countFrames(inlineFrameRange);
-          // Rotate inline frames right before its caller frame.
-          std::rotate(
-              frames.begin() + i,
-              frames.begin() + addrCount,
-              frames.begin() + addrCount + numInlined);
-          addrCount += numInlined;
-        } else {
+//      if (mode_ == LocationInfoMode::FULL_WITH_INLINE &&
+//          frameCount > addrCount) {
+//        size_t maxInline = std::min<size_t>(
+//            Dwarf::kMaxInlineLocationInfoPerFrame, frameCount - addrCount);
+//        // First use the trailing empty frames (index starting from addrCount)
+//        // to get the inline call stack, then rotate these inline functions
+//        // before the caller at `frame[i]`.
+//        folly::Range<SymbolizedFrame*> inlineFrameRange(
+//            frames.begin() + addrCount,
+//            frames.begin() + addrCount + maxInline);
+//        setSymbolizedFrame(frame, elfFile, adjusted, mode_, inlineFrameRange);
+//
+//        numInlined = countFrames(inlineFrameRange);
+//        // Rotate inline frames right before its caller frame.
+//        std::rotate(
+//            frames.begin() + i,
+//            frames.begin() + addrCount,
+//            frames.begin() + addrCount + numInlined);
+//        addrCount += numInlined;
+//      } else {
           setSymbolizedFrame(frame, elfFile, adjusted, mode_);
-        }
+          frame.addr = addr;
+//      }
         --remaining;
-        if (symbolCache_) {
-          // frame may already have been set here.  That's ok, we'll just
-          // overwrite, which doesn't cause a correctness problem.
-          CachedSymbolizedFrames cacheFrames;
-          std::copy(
-              frames.begin() + i,
-              frames.begin() + i + std::min(numInlined + 1, cacheFrames.size()),
-              cacheFrames.begin());
-          symbolCache_->wlock()->set(addr, cacheFrames);
-        }
-        // Skip over the newly added inlined items.
-        i += numInlined;
+//      if (symbolCache_) {
+//        // frame may already have been set here.  That's ok, we'll just
+//        // overwrite, which doesn't cause a correctness problem.
+//        CachedSymbolizedFrames cacheFrames;
+//        std::copy(
+//            frames.begin() + i,
+//            frames.begin() + i + std::min(numInlined + 1, cacheFrames.size()),
+//            cacheFrames.begin());
+//        symbolCache_->wlock()->set(addr, cacheFrames);
+//      }
+//      // Skip over the newly added inlined items.
+//      i += numInlined;
       }
     }
   }
-
+  closeNoInt(fd);
   return addrCount;
 }
 
