@@ -36,16 +36,12 @@ void __real___cxa_throw(
 void* __real___cxa_begin_catch(void* excObj) throw();
 void __real___cxa_rethrow(void) __attribute__((__noreturn__));
 void __real___cxa_end_catch(void);
-void __real__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep)
-     __attribute__((__noreturn__));
 void __wrap___cxa_throw(
     void* thrownException, std::type_info* type, void (*destructor)(void*))
     __attribute__((__noreturn__));
 void* __wrap___cxa_begin_catch(void* excObj) throw();
 void __wrap___cxa_rethrow(void) __attribute__((__noreturn__));
 void __wrap___cxa_end_catch(void);
-void __wrap__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep)
-     __attribute__((__noreturn__));
 }
 
 } // namespace __cxxabiv1
@@ -150,7 +146,13 @@ void __wrap___cxa_end_catch() {
 
 namespace std {
 
-void __real__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep);
+extern "C" {
+void __real__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep)
+     __attribute__((__noreturn__));
+void __wrap__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep)
+     __attribute__((__noreturn__));
+}
+
 void __wrap__ZSt17rethrow_exceptionNSt15__exception_ptr13exception_ptrE(std::exception_ptr ep) {
   // Mangled name for std::rethrow_exception
   // TODO(tudorb): Dicey, as it relies on the fact that std::exception_ptr
